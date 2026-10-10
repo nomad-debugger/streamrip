@@ -32,12 +32,33 @@ from .track import Track
 logger = logging.getLogger("streamrip")
 
 
+def _format_track_album_folder(
+    config: Config,
+    source: str,
+    meta: AlbumMetadata,
+) -> str:
+    """Compute the on-disk folder for a playlist track using its *own* real
+    album metadata and `folder_format`, exactly as is done for albums and
+    singles. A playlist track still belongs to an album -- the playlist
+    itself is just the list of tracks to fetch, not a location on disk.
+    """
+    c = config.session
+    parent = c.downloads.folder
+    if c.downloads.source_subdirectories:
+        parent = os.path.join(parent, source.capitalize())
+    formatter = c.filepaths.folder_format
+    folder = clean_filepath(
+        meta.format_folder_path(formatter),
+        c.filepaths.restrict_characters,
+    )
+    return os.path.join(parent, folder)
+
+
 @dataclass(slots=True)
 class PendingPlaylistTrack(Pending):
     id: str
     client: Client
     config: Config
-    folder: str
     playlist_name: str
     position: int
     db: Database
@@ -73,10 +94,12 @@ class PendingPlaylistTrack(Pending):
         if c.set_playlist_to_album:
             album.album = self.playlist_name
 
+        folder = _format_track_album_folder(self.config, self.client.source, album)
+
         quality = self.config.session.get_source(self.client.source).quality
         try:
             embedded_cover_path, downloadable = await asyncio.gather(
-                self._download_cover(album.covers, self.folder),
+                self._download_cover(album.covers, folder),
                 self.client.get_downloadable(self.id, quality),
             )
         except NonStreamableError as e:
@@ -88,7 +111,7 @@ class PendingPlaylistTrack(Pending):
             meta,
             downloadable,
             self.config,
-            self.folder,
+            folder,
             embedded_cover_path,
             self.db,
         )
@@ -170,14 +193,11 @@ class PendingPlaylist(Pending):
             logger.error(f"Error creating playlist: {e}")
             return None
         name = meta.name
-        parent = self.config.session.downloads.folder
-        folder = os.path.join(parent, clean_filepath(name))
         tracks = [
             PendingPlaylistTrack(
                 id,
                 self.client,
                 self.config,
-                folder,
                 name,
                 position + 1,
                 self.db,
@@ -242,9 +262,6 @@ class PendingLastfmPlaylist(Pending):
                 requests.append(self._make_query(f"{title} {artist}", s, callback))
             results: list[tuple[str | None, bool]] = await asyncio.gather(*requests)
 
-        parent = self.config.session.downloads.folder
-        folder = os.path.join(parent, clean_filepath(playlist_title))
-
         pending_tracks = []
         for pos, (id, from_fallback) in enumerate(results, start=1):
             if id is None:
@@ -262,7 +279,6 @@ class PendingLastfmPlaylist(Pending):
                     id,
                     client,
                     self.config,
-                    folder,
                     playlist_title,
                     pos,
                     self.db,
