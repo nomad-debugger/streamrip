@@ -11,16 +11,16 @@ import aiohttp
 from ..config import Config
 from ..exceptions import NonStreamableError
 from .client import Client
-from .downloadable import TidalDownloadable
+from .downloadable import TidalDASHDownloadable, TidalDownloadable
 
 logger = logging.getLogger("streamrip")
 
 BASE = "https://api.tidalhifi.com/v1"
 AUTH_URL = "https://auth.tidal.com/v1/oauth2"
 
-CLIENT_ID = base64.b64decode("ZlgySnhkbW50WldLMGl4VA==").decode("iso-8859-1")
+CLIENT_ID = base64.b64decode("NE4zbjZRMXg5NUxMNUs3cA==").decode("iso-8859-1")
 CLIENT_SECRET = base64.b64decode(
-    "MU5tNUFmREFqeHJnSkZKYktOV0xlQXlLR1ZHbUlOdVhQUExIVlhBdnhBZz0=",
+    "b0tPWGZKVzM3MWNYNnhhWjBQeWhnR05CZE5MbEJaZDRBS0tZb3VnTWppaz0=",
 ).decode("iso-8859-1")
 AUTH = aiohttp.BasicAuth(login=CLIENT_ID, password=CLIENT_SECRET)
 STREAM_URL_REGEX = re.compile(
@@ -166,11 +166,14 @@ class TidalClient(Client):
         except KeyError:
             raise Exception(resp["userMessage"])
         except JSONDecodeError:
+            # Check if this is a DASH manifest (HI_RES_LOSSLESS uses application/dash+xml)
+            mime_type = resp.get("manifestMimeType", "")
+            if mime_type == "application/dash+xml":
+                return await self._get_downloadable_from_dash(track_id, resp)
             logger.warning(
                 f"Failed to get manifest for {track_id}. Retrying with lower quality."
             )
             return await self.get_downloadable(track_id, quality - 1)
-
         logger.debug(manifest)
         enc_key = manifest.get("keyId")
         if manifest.get("encryptionType") == "NONE":
@@ -181,6 +184,64 @@ class TidalClient(Client):
             codec=manifest["codecs"],
             encryption_key=enc_key,
             restrictions=manifest.get("restrictions"),
+        )
+
+    async def _get_downloadable_from_dash(self, track_id: str, resp: dict):
+        import xml.etree.ElementTree as ET
+
+        dash_xml = base64.b64decode(resp["manifest"]).decode("utf-8")
+        logger.debug(f"Parsing DASH manifest for track {track_id}")
+
+        ns = {"mpd": "urn:mpeg:dash:schema:mpd:2011"}
+        root = ET.fromstring(dash_xml)
+
+        representation = root.find(".//mpd:Representation", ns)
+        if representation is None:
+            raise Exception(f"No Representation found in DASH manifest for {track_id}")
+
+        codecs = representation.get("codecs")
+        sample_rate = representation.get("audioSamplingRate")
+        logger.debug(f"DASH manifest: codecs={codecs}, sampleRate={sample_rate}")
+
+        seg_template = representation.find("mpd:SegmentTemplate", ns)
+        if seg_template is None:
+            raise Exception(f"No SegmentTemplate in DASH manifest for {track_id}")
+
+        init_url = seg_template.get("initialization")
+        media_template = seg_template.get("media")
+        start_number = int(seg_template.get("startNumber", "1"))
+
+        if not init_url or not media_template:
+            raise Exception(
+                f"Missing initialization or media URL in DASH manifest for {track_id}"
+            )
+
+        # Parse segment timeline to get total segment count
+        timeline = seg_template.find("mpd:SegmentTimeline", ns)
+        if timeline is None:
+            raise Exception(f"No SegmentTimeline in DASH manifest for {track_id}")
+
+        # Build full segment URL list from the timeline
+        segment_numbers = []
+        seg_num = start_number
+        for s in timeline.findall("mpd:S", ns):
+            repeat = int(s.get("r", "0"))
+            for _ in range(repeat + 1):
+                segment_numbers.append(seg_num)
+                seg_num += 1
+
+        segment_urls = [
+            media_template.replace("$Number$", str(n)) for n in segment_numbers
+        ]
+
+        logger.debug(f"DASH: {len(segment_urls)} segments for track {track_id}")
+
+        return TidalDASHDownloadable(
+            self.session,
+            init_url=init_url,
+            segment_urls=segment_urls,
+            codec=codecs,
+            encryption_key=None,
         )
 
     async def get_video_file_url(self, video_id: str) -> str:
